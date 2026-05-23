@@ -3,9 +3,9 @@ import json
 import random
 from pathlib import Path
 from datetime import datetime
+from supabase import create_client
 
 VOCAB_FILE = "vocab_vi.json"
-PROGRESS_FILE = "progress.json"
 
 st.set_page_config(
     page_title="TOEIC Vocab Trainer",
@@ -13,39 +13,134 @@ st.set_page_config(
     layout="centered"
 )
 
+# =========================
+# KẾT NỐI SUPABASE
+# =========================
+
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = get_supabase()
+
+# =========================
+# ĐỌC TỪ VỰNG
+# =========================
+
+@st.cache_data
 def load_vocab():
+    if not Path(VOCAB_FILE).exists():
+        return []
+
     with open(VOCAB_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def load_progress():
-    if Path(PROGRESS_FILE).exists():
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+vocab = load_vocab()
 
-def save_progress(progress):
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(progress, f, ensure_ascii=False, indent=2)
+if not vocab:
+    st.error("Không tìm thấy file vocab_vi.json.")
+    st.stop()
 
-def update_progress(word, correct):
-    progress = load_progress()
+# =========================
+# HÀM XỬ LÝ TIẾN ĐỘ
+# =========================
 
-    if word not in progress:
-        progress[word] = {
-            "correct": 0,
-            "wrong": 0,
-            "last_review": ""
-        }
+def load_progress(user_id):
+    """
+    Đọc tiến độ của riêng user_id từ Supabase.
+    Trả về dạng:
+    {
+        "word": {"correct": 1, "wrong": 2, "last_review": "..."}
+    }
+    """
+    try:
+        response = (
+            supabase
+            .table("progress")
+            .select("word, correct, wrong, last_review")
+            .eq("user_id", user_id)
+            .execute()
+        )
 
-    if correct:
-        progress[word]["correct"] += 1
-    else:
-        progress[word]["wrong"] += 1
+        progress = {}
 
-    progress[word]["last_review"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_progress(progress)
+        for row in response.data:
+            progress[row["word"]] = {
+                "correct": row.get("correct", 0),
+                "wrong": row.get("wrong", 0),
+                "last_review": row.get("last_review", "")
+            }
 
-def get_new_index(vocab):
+        return progress
+
+    except Exception as e:
+        st.error(f"Lỗi đọc tiến độ từ Supabase: {e}")
+        return {}
+
+
+def update_progress(user_id, word, correct_answer):
+    """
+    Cập nhật tiến độ của 1 từ.
+    Nếu chưa có thì insert.
+    Nếu có rồi thì update.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        # Tìm dòng hiện tại
+        response = (
+            supabase
+            .table("progress")
+            .select("correct, wrong")
+            .eq("user_id", user_id)
+            .eq("word", word)
+            .execute()
+        )
+
+        if response.data:
+            current = response.data[0]
+            new_correct = current.get("correct", 0)
+            new_wrong = current.get("wrong", 0)
+
+            if correct_answer:
+                new_correct += 1
+            else:
+                new_wrong += 1
+
+            (
+                supabase
+                .table("progress")
+                .update({
+                    "correct": new_correct,
+                    "wrong": new_wrong,
+                    "last_review": now
+                })
+                .eq("user_id", user_id)
+                .eq("word", word)
+                .execute()
+            )
+
+        else:
+            (
+                supabase
+                .table("progress")
+                .insert({
+                    "user_id": user_id,
+                    "word": word,
+                    "correct": 1 if correct_answer else 0,
+                    "wrong": 0 if correct_answer else 1,
+                    "last_review": now
+                })
+                .execute()
+            )
+
+    except Exception as e:
+        st.error(f"Lỗi lưu tiến độ vào Supabase: {e}")
+
+
+def get_new_index():
     old_index = st.session_state.get("index", None)
 
     if len(vocab) <= 1:
@@ -58,16 +153,17 @@ def get_new_index(vocab):
 
     return new_index
 
+
 def next_card():
-    st.session_state["index"] = get_new_index(vocab)
+    st.session_state["index"] = get_new_index()
     st.session_state["show_answer"] = False
-    st.session_state["checked"] = False
 
     if "choices" in st.session_state:
         del st.session_state["choices"]
 
     if "result" in st.session_state:
         del st.session_state["result"]
+
 
 def init_state():
     if "index" not in st.session_state:
@@ -76,19 +172,39 @@ def init_state():
     if "show_answer" not in st.session_state:
         st.session_state["show_answer"] = False
 
-    if "checked" not in st.session_state:
-        st.session_state["checked"] = False
 
-if not Path(VOCAB_FILE).exists():
-    st.error("Không tìm thấy file vocab_vi.json.")
-    st.stop()
-
-vocab = load_vocab()
-progress = load_progress()
-init_state()
+# =========================
+# ĐĂNG NHẬP ĐƠN GIẢN
+# =========================
 
 st.title("📘 TOEIC Vocab Trainer")
 st.write("Học từ vựng TOEIC bằng tiếng Việt.")
+
+st.sidebar.title("Người học")
+
+user_id = st.sidebar.text_input(
+    "Nhập tên hoặc mã học viên",
+    placeholder="Ví dụ: thanh, phuong, an01"
+)
+
+if not user_id:
+    st.info("Hãy nhập tên hoặc mã học viên ở thanh bên trái để bắt đầu học.")
+    st.stop()
+
+user_id = user_id.strip().lower()
+
+if len(user_id) < 2:
+    st.warning("Tên/mã học viên nên có ít nhất 2 ký tự.")
+    st.stop()
+
+progress = load_progress(user_id)
+init_state()
+
+st.sidebar.success(f"Đang học với mã: {user_id}")
+
+# =========================
+# MENU
+# =========================
 
 st.sidebar.title("Menu")
 mode = st.sidebar.radio(
@@ -99,6 +215,10 @@ mode = st.sidebar.radio(
 st.sidebar.write("---")
 st.sidebar.write(f"Tổng số từ: **{len(vocab)}**")
 st.sidebar.write(f"Đã học: **{len(progress)}**")
+
+# =========================
+# FLASHCARD
+# =========================
 
 if mode == "Flashcard":
     st.header("🃏 Flashcard")
@@ -126,15 +246,19 @@ if mode == "Flashcard":
 
         with col3:
             if st.button("✅ Tôi nhớ đúng", key="right_flashcard"):
-                update_progress(item["word"], True)
+                update_progress(user_id, item["word"], True)
                 next_card()
                 st.rerun()
 
         with col4:
             if st.button("❌ Tôi chưa nhớ", key="wrong_flashcard"):
-                update_progress(item["word"], False)
+                update_progress(user_id, item["word"], False)
                 next_card()
                 st.rerun()
+
+# =========================
+# TRẮC NGHIỆM
+# =========================
 
 elif mode == "Trắc nghiệm":
     st.header("📝 Trắc nghiệm 4 đáp án")
@@ -163,10 +287,10 @@ elif mode == "Trắc nghiệm":
         if st.button("Kiểm tra", key="check_quiz"):
             if choice == item["meaning_vi"]:
                 st.session_state["result"] = "correct"
-                update_progress(item["word"], True)
+                update_progress(user_id, item["word"], True)
             else:
                 st.session_state["result"] = "wrong"
-                update_progress(item["word"], False)
+                update_progress(user_id, item["word"], False)
 
     with col2:
         if st.button("➡️ Câu tiếp theo", key="next_quiz"):
@@ -179,6 +303,10 @@ elif mode == "Trắc nghiệm":
     if st.session_state.get("result") == "wrong":
         st.error("Sai rồi.")
         st.info(f"Đáp án đúng: {item['meaning_vi']}")
+
+# =========================
+# TÌM KIẾM
+# =========================
 
 elif mode == "Tìm kiếm từ":
     st.header("🔎 Tìm kiếm từ")
@@ -198,10 +326,14 @@ elif mode == "Tìm kiếm từ":
                 st.write(f"**Nghĩa:** {item['meaning_vi']}")
                 st.write(f"**Nguồn:** {item.get('source', '')} - trang {item.get('page', '')}")
 
+# =========================
+# THỐNG KÊ
+# =========================
+
 elif mode == "Thống kê":
     st.header("📊 Thống kê")
 
-    progress = load_progress()
+    progress = load_progress(user_id)
 
     total_correct = sum(p["correct"] for p in progress.values())
     total_wrong = sum(p["wrong"] for p in progress.values())
